@@ -2,5 +2,12 @@
   "name": "t2sde",
   "description": "Reads/writes/builds t2sde Instructions",
   "bin": "t2",
-  "version": "0.0.0-pre.0"
+  "version": "0.0.0-pre.0",
+  "files": [
+    "dist",
+    "bin",
+    "*",
+    "!dist/**/*.map",
+    "!dist/**/__tests__"
+  ]
 }

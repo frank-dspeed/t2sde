@@ -6,4 +6,4 @@ ${platform}-§{arch}/${platform}-§{arch}.ts
 
 Rules:
 - using named exports only for static analytics
-- only Strip able typescript syntax. [tsconfig.json { compilerOptions: ears}](https://www.typescriptlang.org/tsconfig/#erasableSyntaxOnly)
+- only Strip able typescript syntax. [tsconfig.json#erasableSyntaxOnly](https://www.typescriptlang.org/tsconfig/#erasableSyntaxOnly)

@@ -1,145 +1,229 @@
-# Notes for AI Agents Working in This Tree
+# AGENTS.md — T2 SDE Master System Reference & Operating Rules
 
-Practical operating notes for coding agents (Claude, Codex, etc.) working on
-T2 SDE `.desc`/`.cache`/`scripts/*` fixes and cross-compile builds.
-Complements `README.md` (the human developer cheatsheet) — read that first for
-command syntax; this file is about the gotchas that aren't obvious from it.
+Exhaustive, zero-lookup reference for AI coding agents working in the T2 SDE tree. Eliminates the need to read `README.md` or grep `scripts/functions.in` for standard syntax.
 
-## Core rule: real fixes only
+---
 
-This is a cross-compiling build system. A fix must actually work under real
-cross-compilation, not just look plausible. Never:
-1. disable a check to make an error go away without understanding it
-2. hardcode a flag/path to bypass a genuinely missing dependency
-3. claim something is fixed without test building it.
-   Always verify: check the package size in `var/adm/packages/<pkg>`
-   ("0.00 MB, N files" with N ~5-7 = phantom, bookkeeping-only install, not a
-    real one) and, for anything you can directly test, that the installed files
-   actually work (e.g. `import lxml`, `meson --version`).
-4. If a package needs to run a native executable helper to build, it needs to be
-   built within the package, or if it is a bigger, shared tool in the t2 native
-   tools stage 0 and installed into the build's sysroot/TOOLCHAIN/cross.
+## 1. CLI & Filesystem Reference
 
-## `.desc` / `.cache` — the two most-repeated mistakes
+### Core Commands
+* **Build specific stage & pkg:** `./t2 build-target -cfg <cfg> <stage>-<pkg>`
+* **Build single pkg (auto-stage):** `./t2 build -cfg <cfg> <pkg>`
+* **Build full target:** `./t2 build-target -cfg <cfg>`
+* **Download sources:** `./t2 download <pkg>` (or `-all`)
+* **Update checksums (`[D]`):** `./t2 update-cksum <pkg>`
+* **Create new pkg:** `./t2 create <url>`
+* **Upgrade pkg version:** `./t2 up <pkg> <new_ver>`
+* **Clean build failures/state:** `./t2 clean -cfg <cfg>`
 
-1. Do not simply disable features that do not build, correctly conditoinalize
-   optional dependencies to pkginstalled $pkg || ...disable feature... or
-   atstage cross && ... if a feature does not cross compile for reasons.
-2. **Adding `[E] add pkg` / `[E] opt pkg` to a `.desc` without also adding the
-   matching `[DEP] pkg` / `[OPT] pkg` line to that package's `.cache`** (same
-   directory, `<pkg>.cache`). The `.cache` file is what the build *scheduler*
-   uses for dependency-graph/build-order decisions; a `.desc`-only edit does
-   not mmediate take effect for a full/bulk target build until the `.cache`
-   also has it (or a full successful build regenerates the cache itself).
-3. **The opposite mistake, just as common: adding `[E] add pkg` when `pkg` is
-   ALREADY listed in the `.cache`.** If it's already there, the dependency is
-   already correctly tracked — adding a `.desc` line is a no-op that doesn't
-   fix anything and just adds noise. **Before adding an `[E]` line, grep the
-   `.cache` first.** If the error is "dependency not found" but the `.cache`
-   already lists it, the real problem is something else: the dependency
-   package isn't actually built for this target yet, it's stale (version
-   mismatch), or there's a real build-system bug (see the "Common root
-   causes" section below) — go find that instead.
-4. `pkginstalled()` (in `scripts/functions.in`) takes multiple package names
-   for a dependency group in one call and returns true only if **all** are
-   installed — use `pkginstalled pkgA pkgB || ...` for a combined AND-gate
-   instead of two separate calls. It also auto-registers every argument as
-   an `[E] opt` dependency (visible as `[OPT]` in the `.cache` after a build) —
-   so a dynamic `pkginstalled` check in the script body does NOT also need a
-   static `[E] opt` line; that would be redundant, same as point 2 above.
-5. If a package needs its `configure`/`Makefile` regenerated (tarball ships
-   only `configure.ac`/`Makefile.am`), set `autogen=1` (or `2`) in the
-   `.desc` — do not hand-add a `hook_add preconf ... "autoreconf ..."` line.
-   The generic build flow already has this path built in.
-6. Code belongs to the end of .desc, not in the middle between tags.
-7. Do not cause random white-space and new-line damage.
-8. Update `<pkg>.cache` files from successful builds with relevant depencency
-   changes.
+### Key Tree & Build Paths
+* **Package definition:** `package/<repo>/<pkg>/<pkg>.desc`
+* **Dependency/Scheduler cache:** `package/<repo>/<pkg>/<pkg>.cache`
+* **Package patches:** `package/<repo>/<pkg>/*.patch`
+* **Build error log ( active/failed ):** `build/<cfg>-*/var/adm/logs/<stage>-<pkg>.err`
+* **Build success log:** `build/<cfg>-*/var/adm/logs/<stage>-<pkg>.log`
+* **Installed package manifest:** `build/<cfg>-*/var/adm/packages/<pkg>`
+* **File list (`flist`):** `build/<cfg>-*/var/adm/flists/<pkg>`
+* **Target sysroot:** `build/<cfg>-*/`
+* **Host cross-toolchain & native helpers:** `build/<cfg>-*/TOOLCHAIN/cross/`
+* **Core build engine:** `scripts/functions.in`, `scripts/Build-Pkg`, `scripts/Build-Target`, `scripts/parse-config`
 
-## Comments and attribution
+---
 
-- Do not add comments for obvious one-lineers or conditionals.
-- Inline comments in `.desc`/patch files: max 1-2 short lines, and never
-  prefixed with a maintainer's name/email (e.g. no `# René Rebe: ...`). That
-  belongs in the commit message, not scattered through every source file.
-- Patches apply at `-p1`. 
-  `diff -u`/`svn diff`-style hunks with real context so the affected function
-  is visible in the hunk header.
-- `t2 create` and normal `.desc` edits already carry the standard T2
-  copyright header — don't invent a different header style.
-- Do not add signed-off-by or additonal copyright to pkgs .patch files..
-- Name temporary latest compiler or other API pkg patches `hotfix-*.patch`.
-  Keep filenames short.
+## 2. Build Stages (`[P]` Tag & `atstage`)
 
-## Disk space
+| Stage | `atstage` Check | Purpose / Execution Context |
+| :--- | :--- | :--- |
+| **`0`** | `atstage toolchain` | **Host/Bootstrap.** Built natively on the host OS. Installed into `build/<cfg>-*/TOOLCHAIN/cross`. Used for cross-compilers, build tools (`cmake`, `meson`), and native code generators (`meinproc6`, `protocolgen`). |
+| **`1`** | `atstage cross` (or `crossbuild`) | **Cross-Bootstrap.** Core minimal libraries/binaries cross-compiled for the target architecture to bootstrap the sysroot. |
+| **`2`** | `atstage cross` (or `crossbuild`) | **Main Cross-Build.** Standard cross-compilation stage for the vast majority of target packages. Target binaries **cannot** be executed on the build host during this stage. |
+| **`3`–`4`** | `atstage native` | **Chroot / Native Bootstrap.** Rebuilding core toolchain inside the target environment (if building natively/chroot). |
+| **`5`** | `atstage native` | **Full Native Build.** Building standard packages natively inside the target system. |
+| **`9`** | `atstage rebuild` | **Final Rebuild / Cleanup.** Final pass for self-hosting verification. |
 
-A prior disk-full event during a mass build is what caused a large fraction
-of one session's failures (silently truncated installs, corrupted native
-tool installs — see below). Before any batch of builds, check
-`df -h /srv/t2` (or wherever the tree lives) and keep a safety margin
-(≥6-10GB free); stop and reassess rather than continuing into a full disk.
+* **`[P]` Priority String Syntax:** `<X|O> <0123456789> <###.###>`
+  * `X` = Enabled by default; `O` = Disabled by default.
+  * `0123456789` = Active stages (`-` = disabled for that stage, digit = enabled). Example: `X -1---5---9 120.500` runs in stages 1, 5, and 9. To enable host helper build in stage 0, change first slot to `0` (`X 01---5---9 ...`).
+  * `###.###` = Topological sort weight (lower builds earlier).
 
-## Common root causes worth checking before deep-diving a new failure
+---
 
-These recurred across many unrelated packages this session — check for them
-first:
+## 3. `.desc` Metadata Tags Reference
 
-- **`python -m installer` bootstrap circularity.** Any PEP517/flit-based
-  Python package's generic install path (`scripts/functions.in`, the
-  `rungpepinstall` branch) ends with `python -m installer .dist/*.whl` —
-  which itself needs the `installer` module already present. `python-installer`
-  itself can't rely on this (chicken/egg). Fixed by giving it a custom
-  `premake`/`inmake` hook pair (`rungpepinstall=0 runmake=0` +
-  `gpep517 build-wheel` + a raw `zipfile` unpack to
-  `sysconfig.get_path('purelib')`), mirroring the same pattern
-  `python-flit-core` already uses via its own `bootstrap_install.py`.
-- **Generic PEP517 install missing `--destdir`.** The same
-  `python -m installer .dist/*.whl` call had no destination root, so it
-  wrote straight into the live host `site-packages` instead of the
-  sandboxed target root — the sandbox's `fl_wrapper.so` correctly blocks
-  that as "write outside basedir", and the package silently ends up with
-  0 real files. Fixed globally: `python -m installer --destdir="$root"
-  .dist/*.whl` in `scripts/functions.in`.
-- **A package needing to run its own just-built binary during its own
-  build**, when that binary is cross-compiled for the target arch and can't
-  execute on the build host. Seen with `kdoctools` (needs to run its own
-  freshly-built `meinproc6` to generate its documentation) and `akonadi`
-  (needs its own `protocolgen` code generator). This needs a *native*
-  companion build of the specific tool (or a `QT_HOST_PATH`/
-  `KF6_HOST_TOOLING`-style host-tool export a dependent's build can pick up)
-  — not something fixable by editing the dependent package alone. Left
-  unresolved this session; flagging as a real, recurring cross-build gap
-  worth a dedicated pass.
-- **KDE Frameworks / Applications version skew.** A tree-wide version bump
-  (e.g. KF6 6.29.0 → 6.30.0, KDE Applications 26.08.0 → 26.08.1) leaves many
-  already-built packages stale (installed at the old version) while their
-  `.desc` declares the new one. Symptom: `Could NOT find KF6Foo ... (found
-  suitable version "6.29.0")` when 6.30.0 was required. Not a bug — just
-  needs a plain rebuild (`./t2 build-target -cfg <cfg> 2-<pkg>`) in roughly
-  dependency order (lower-level frameworks before apps that use them).
-  Compare `head -1 var/adm/packages/<pkg>` (installed version) against
-  `grep '^\[V\]' package/*/<pkg>/<pkg>.desc` (declared version) to find all
-  stale packages at once.
-- **Dead upstream download URLs.** Several `[D]` lines pointed at URLs that
-  407/404 now (`docbook.org` moved to `oasis-open.org`/`archive.docbook.org`,
-  `pagure.io` archive paths moved to `releases.pagure.org`, project domains
-  gone dark). Fix by finding a real, currently-live replacement and verifying
-  it (don't guess a URL or fabricate a checksum).
+All tags must remain at the top of `<pkg>.desc` in standard order. **Never place shell code between tags.**
 
-## Workflow that worked well this session
+| Tag | Name | Syntax / Rules |
+| :--- | :--- | :--- |
+| `[I]` | Title | Short 1-line summary (no trailing period). |
+| `[T]` | Text | Multi-line description of the package. |
+| `[U]` | URL | Upstream homepage URL. |
+| `[A]` | Author | Upstream author/organization. |
+| `[M]` | Maintainer | T2 maintainer name/email. |
+| `[C]` | Category | Primary/secondary category (e.g., `base/system`, `extra/development`). |
+| `[F]` | Flags | Space-separated build flags (see Section 4). |
+| `[E]` | Explicit Dep | `[E] add <pkg>` (hard dep) or `[E] opt <pkg>` (optional dep). Can restrict by stage: `[E] add <pkg> cross`. |
+| `[R]` | Arch Restrict | `+ <arch>` (whitelist) or `- <arch>` (blacklist), e.g., `[R] - avr32 blackfin`. |
+| `[L]` | License | `GPL`, `LGPL`, `MIT`, `BSD`, `MPL`, `Apache`, `OpenSource`, etc. |
+| `[S]` | Status | `Stable`, `Beta`, `Alpha`, `Experimental`. |
+| `[V]` | Version | Upstream version string. |
+| `[P]` | Priority | `<X|O> <stages> <weight>` (see Section 2). |
+| `[O]` | Conf Directives | Optional shared include/config directives. |
+| `[D]` | Download | `<cksum> <filename> <url>`. Use `0` as cksum before running `./t2 update-cksum <pkg>`. |
 
-1. Get the real error text from the actual `.err` log, not just the
-   one-line summary from `list-errors` — the truncated/wrapped summary
-   view can hide or mis-order the real failure line.
-2. When many packages fail with a shared signature, cluster them (grep the
-   tail of each `.err` for the last real error line, normalize, `sort | uniq -c`)
-   before fixing one-by-one — several "35 separate failures" turned out to
-   be 2-3 systemic root causes each affecting dozens of packages.
-3. Fix the systemic/shared-infrastructure bug once (in `scripts/functions.in`,
-   `scripts/parse-config`, or a widely-depended-on package like `perl`),
-   then re-verify a sample of the previously-failing packages rather than
-   patching each one individually.
-4. When dispatching multiple parallel agents/workers on independent package
-   batches, explicitly tell each one: check disk space before/during, expect
-   and tolerate shared-config races, check `.cache` before adding `[E]` lines,
-   use `autogen=`, and don't touch packages another agent/session already owns.
+---
+
+## 4. `[F]` Flags Reference
+
+* **`CROSS`**: Package supports cross-compilation (stages 1/2).
+* **`NO-LTO`**: Disable Link-Time Optimization (use when package fails with LTO linker errors/ICEs).
+* **`NO-PIE` / `NO-SSP`**: Disable Position Independent Executables or Stack Smashing Protector.
+* **`OBJECDIR`**: Build out-of-tree in a dedicated `objdir` directory (automatically enabled by `cmake`/`meson`, useful for picky autotools/GCC builds).
+* **`FPIC`**: Force `-fPIC` across compilation.
+* **`J1`**: Disable parallel `make` (`-j1`) for packages with broken Makefile race conditions.
+* **`AUTOMAKE-QUIRK`**: Bypass strict automake version checks.
+* **`DIETLIBC` / `UCLIBC` / `MUSL`**: Compatibility markers for alternative C libraries.
+
+---
+
+## 5. Build Variables, Helpers & Execution Hooks
+
+All custom shell logic goes at the **very bottom** of `<pkg>.desc` after `[D]`.
+
+### Variable Manipulation (`var_append` / `var_insert` / `var_remove` / `var_remove_regex`)
+Never overwrite global option variables directly (`confopt="--foo"` wipes defaults). Always mutate:
+* `var_append <var> '<sep>' '<value>'` — Append to end (e.g., `var_append confopt ' ' --disable-nls`)
+* `var_insert <var> '<sep>' '<value>'` — Prepend to start (e.g., `var_insert GCC_WRAPPER_INSERT ' ' -I$root/usr/include`)
+* `var_remove <var> '<sep>' '<value>'` — Remove exact match
+* `var_remove_regex <var> '<sep>' '<regex>'` — Remove by pattern (e.g., `var_remove_regex makeopt ' ' 'CC=.*'`)
+
+### Core Build Variables
+
+| Variable | Build System / Scope | Default / Usage |
+| :--- | :--- | :--- |
+| `confopt` | Autotools (`./configure`), CMake (`cmake`), Meson (`meson`) | Auto-populated; T2 intercepts `--enable-*`/`--with-*` or `-D*` depending on active generator. |
+| `extraconfopt` | Autotools | Appended to `confopt`. |
+| `makeopt` | `make` / `ninja` | Flags passed during build phase (`runmake=1`). Set `makeopt=` to skip build step or override targets. |
+| `makeinstopt` | `make install` / `ninja install` | Flags passed during install phase (`DESTDIR=$root` handled automatically). Set `makeinstopt=` to skip default install. |
+| `autogen` | Autotools | `autogen=1` runs `autoreconf`/autogen scripts before `configure`. |
+| `runconf` | `./configure` | Set `runconf=0` to skip `./configure`. |
+| `runcmake` | CMake | Set `runcmake=0` to disable automatic `cmake` invocation if package has both `CMakeLists.txt` and `Makefile`. |
+| `runmeson` | Meson | Set `runmeson=0` to disable automatic `meson` invocation. |
+| `rungpepinstall`| Python PEP517 | Set `rungpepinstall=0` to disable default PEP517 wheel build/install. |
+| `runmake` | `make` | Set `runmake=0` to disable default `make` and `make install` runs. |
+| `srcdir` | Source extraction | Subdirectory inside tarball (`srcdir=foo-$ver/src`). |
+| ` patchfiles` | Patch application | Space-separated list of patches (`var_append patchfiles ' ' $confdir/extra.patch`). |
+| `GCC_WRAPPER_APPEND` | Compiler wrapper | Append flags directly to `gcc`/`clang` calls (`var_append GCC_WRAPPER_APPEND ' ' -Wno-error=incompatible-pointer-types`). |
+| `GCC_WRAPPER_INSERT` | Compiler wrapper | Prepend flags to compiler calls. |
+| `GCC_WRAPPER_REMOVE` | Compiler wrapper | Strip problematic flags injected by upstream Makefiles (`var_append GCC_WRAPPER_REMOVE ' ' -Werror`). |
+
+### Path & Environment Variables (Available in `.desc` Script Body)
+* `$root` — Sandbox destination prefix (`""` in native stage 5, `build/<cfg>-*` in cross stages 1/2). **Always prefix target install paths with `$root` (e.g., `$root$bindir`, `$root$libdir`, `$root/etc`).**
+* `$prefix` — Package prefix (usually `/usr` or `usr` depending on context; `$root/$prefix` is safe).
+* `$bindir`, `$sbindir`, `$libdir`, `$includedir`, `$datadir`, `$docdir`, `$sysconfdir` — Standard FHS paths (already include leading `/`, so use `$root$libdir`).
+* `$base` — Root of the T2 SDE source tree.
+* `$confdir` — Directory of the current package (`package/<repo>/<pkg>`).
+* `$builddir` — Temporary build workspace where tarballs are unpacked.
+* `$arch_target` / `$arch_build` — Target vs. host GNU triplets (e.g., `aarch64-t2-linux-gnu` vs. `x86_64-t2-linux-gnu`).
+* `$CC`, `$CXX`, `$AR`, `$RANLIB`, `$LD`, `$STRIP` — Target tool binaries (automatically point to cross-tools in stages 1/2).
+* `$HOSTCC`, `$HOSTCXX` — Native build-host compiler (`gcc`, `g++`).
+
+### Execution Hooks (`hook_add <hook> <priority> "<command>"`)
+Priority `1`–`9` (`5` is standard). Execution order:
+1. `prepauto` — Before unpacking sources.
+2. `prepatch` — After unpack, before applying `.patch` files.
+3. `postpatch` — After applying patches, before autogen/configure (ideal for `sed` fixes on `CMakeLists.txt` or `configure.ac`).
+4. `preconf` — Right before `./configure` / `cmake` / `meson`.
+5. ` premake` — After configure, before `make` / `ninja`.
+6. `inmake` — During build, right after `make` completes, before `make install`.
+7. `postmake` — After `make install` completes (ideal for installing extra binaries, symlinks, or fixing file permissions in `$root`).
+8. `postdoc` — After documentation compression/handling.
+9. `postflist` — At the very end after file list generation.
+
+### Helper Functions (`scripts/functions.in`)
+* `pkginstalled <pkgA> [pkgB ...]` — Returns `0` (true) only if **all** specified packages are installed in the target. Automatically registers each argument as `[OPT]` in `.cache`.
+* `pkgprefix [-t] <var> <pkg>` — Queries prefix/path metadata of an installed package (`pkgprefix libdir libx11`). Remember to run `pkginstalled <pkg>` before calling `pkgprefix` if the dependency is optional.
+* `atstage <stage_name>` — Returns `0` if currently building in `<toolchain|cross|native|rebuild>`.
+
+---
+
+## 6. Non-Negotiable Core Rules
+
+1. **Disk Space Gate:** Run `df -h` before any single or batch build. Abort immediately if free space is `< 8 GB`. Disk-full conditions cause truncated installs and silent toolchain corruption.
+2. **Real Cross-Compile Fixes Only:** Never blindly disable configure checks or hardcode host paths (`/usr/include`, `/usr/lib`) to bypass missing target dependencies.
+3. **Mandatory Build & Verification:** Never declare a package fixed without running a test build. Post-build verification checklist:
+   * Check `build/<cfg>-*/var/adm/packages/<pkg>`: If size is `0.00 MB` with ~5–7 files, it is a **phantom install** (only metadata files exist; `fl_wrapper.so` blocked host writes or `--destdir` was omitted).
+   * Test the resulting binaries/modules directly where feasible (`python -c "import <mod>"`, `<tool> --version`).
+4. **Native Build Helpers (`stage 0`):** Target binaries built in stage 1/2 cannot run on the build host. If a package executes its own compiled binary during build (`meinproc6`, `protocolgen`, `wayland-scanner`, `glib-compile-schemas`):
+   * Either compile the small helper tool inside `premake` using `$HOSTCC`, OR
+   * Enable stage `0` in `[P]` (`X 01---5---9 ...`) so T2 builds a native version into `TOOLCHAIN/cross` first, and pass the host tool path (`-DKF6_HOST_TOOLING=...`, `-DQT_HOST_PATH=...`) during `atstage cross`.
+
+---
+
+## 7. `.desc` & `.cache` Dependency Laws
+
+1. **Grep `.cache` BEFORE adding `[E]`:** Always run `grep <dep> package/*/<pkg>/<pkg>.cache` first.
+   * **If already in `.cache`:** **DO NOT** add `[E] add/opt <dep>` to `.desc`. The dependency is already tracked; adding `[E]` is no-op noise. The real failure is an unbuilt target package, version skew, or a build script bug.
+   * **If missing from `.cache`:** Add `[E] add <dep>` (or `[E] opt <dep>`) to `<pkg>.desc` **AND** immediately add `[DEP] <dep>` (or `[OPT] <dep>`) to `<pkg>.cache`. The build scheduler reads `.cache` exclusively; `.desc`-only edits have zero effect on bulk target build ordering until `.cache` is updated.
+2. **Use `pkginstalled` for Optional Features:**
+   * Never unconditionally disable features just to make a build pass. Gate them:
+     `pkginstalled foo || var_append confopt ' ' --disable-foo`
+   * Use multi-arg AND-gates instead of nested `if` statements:
+     `pkginstalled pkgA pkgB || var_append confopt ' ' -DENABLE_FEATURE=OFF`
+   * **No Redundant `[E] opt`:** Because `pkginstalled` dynamically registers `[OPT]` in `.cache`, never add a static `[E] opt <pkg>` line for any package already queried via `pkginstalled`.
+3. **Use `autogen=1`, Not Custom Hooks:** If a tarball ships `configure.ac`/`Makefile.am` without `configure`, put `autogen=1` at the bottom of `.desc`. Never write `hook_add preconf 5 "autoreconf -fi"`.
+4. **Preserve `.cache` Updates:** When a successful build updates `<pkg>.cache` with valid new dependencies, include the updated `.cache` in your changes.
+
+---
+
+## 8. Code Style, Patches & Attribution
+
+* **Minimal Comments:** Do not add comments explaining obvious 1-liners or `pkginstalled`/`atstage` conditionals. When a comment is strictly necessary for a non-obvious workaround, keep it to 1–2 short lines.
+* **Zero Inline Attribution:** Never include maintainer or agent names/emails in `.desc` or `.patch` comments (no `# René Rebe: ...`). Attribution belongs exclusively in commit messages.
+* **Headers & Whitespace:** Preserve standard T2 copyright headers generated by `t2 create`. Never introduce unrelated whitespace, tab, or newline diffs.
+* **Patch Standards:**
+  * Must apply cleanly at `-p1`.
+  * Format as `diff -u` / `svn diff` with enough context so the affected function signature appears in the `@@` hunk header.
+  * Never include `Signed-off-by:` or extra copyright blocks inside `.patch` files.
+  * Name temporary compiler/API fixes `hotfix-<short-topic>.patch` (e.g., `hotfix-gcc14.patch`). Keep filenames short.
+
+---
+
+## 9. Diagnostic Playbook & Common Root Causes
+
+### Triage Workflow
+1. **Inspect raw `.err` logs:** Never diagnose from `list-errors` 1-line summaries (they truncate the actual compiler/CMake error). Read `build/<cfg>-*/var/adm/logs/<stage>-<pkg>.err`.
+2. **Cluster systemic failures:** When multiple packages fail in a batch build, extract the last error lines across `.err` files, normalize, and run `sort | uniq -c`. Fix shared infrastructure bugs once in `scripts/functions.in`, `scripts/parse-config`, or core library packages rather than patching 30 leaf packages.
+
+### Recurring Failure Signatures
+* **Sandbox Violations (`fl_wrapper.so: write outside basedir`) & Phantom Installs:**
+  * **Cause:** Build system ignores `DESTDIR` or `--destdir` and writes directly into host `/usr`. `fl_wrapper.so` blocks the write, leaving a `0.00 MB` package.
+  * **Fix:** Pass `$root` explicitly (e.g., for PEP517: `python -m installer --destdir="$root" .dist/*.whl` in `scripts/functions.in`; for custom Makefiles: `var_append makeinstopt ' ' PREFIX=$root/$prefix`).
+* **Python PEP517 Bootstrap Circularity (`python-installer`, `python-flit-core`):**
+  * **Cause:** Standard `rungpepinstall` runs `python -m installer .dist/*.whl`, which fails when building `python-installer` itself.
+  * **Fix:** Bypass `rungpepinstall`:
+    ```sh
+    rungpepinstall=0 runmake=0
+    hook_add premake 5 "gpep517 build-wheel --wheel-dir .dist --output-fd 1"
+    hook_add inmake 5 "python3 -c \"import zipfile, sysconfig; zipfile.ZipFile('.dist/foo.whl').extractall(sysconfig.get_path('purelib'))\""
+    ```
+    *(Ensure target `purelib` path is prefixed with `$root` during cross stages).*
+* **KDE Frameworks (KF6) / Applications Version Skew:**
+  * **Symptom:** `Could NOT find KF6Foo ... (found suitable version "6.29.0", minimum required is "6.30.0")`.
+  * **Cause:** Tree-wide `.desc` version bump occurred after lower-level dependencies were already built at the older version.
+  * **Fix:** Not a `.desc` bug. Find all stale installed packages by comparing `head -n1 build/<cfg>-*/var/adm/packages/<pkg>` against `grep '^\[V\]' package/*/<pkg>/<pkg>.desc`, then rebuild stale packages in topological order (`./t2 build-target -cfg <cfg> 2-<pkg>`).
+* **Cross-Compile Header / Library Leakage (`-I/usr/include` or `-L/usr/lib`):**
+  * **Symptom:** Linker errors (`skipping incompatible /usr/lib/libfoo.so` or `file in wrong format`) or host header poisoning during stage 1/2.
+  * **Fix:** Remove hardcoded host paths via `GCC_WRAPPER_REMOVE` or patch `CMakeLists.txt`/`Makefile` to use `$SYSROOT` / `pkg-config` properly.
+* **Dead Upstream `[D]` URLs (404 / 407 / Timeout):**
+  * **Cause:** Upstream domain moved or shut down (`docbook.org` -> `archive.docbook.org` / `oasis-open.org`; `pagure.io` archives -> `releases.pagure.org`).
+  * **Fix:** Locate a verified, live upstream mirror, update `[D]`, and verify with `./t2 download <pkg>`. Never guess URLs or fabricate checksums.
+
+---
+
+## 10. Multi-Agent Concurrency Protocol
+
+When multiple agents or sub-workers operate on the same T2 tree concurrently:
+* **Strict Package Partitioning:** Each worker must own a disjoint set of packages. Never edit or build a package assigned to another active worker.
+* **Shared Infrastructure Lock:** If a worker discovers a bug in `scripts/functions.in`, `scripts/parse-config`, or a core stage-0 toolchain package, coordinate before modifying global scripts to avoid breaking active builds.
+* **Tolerate Config Races:** Expect transient lock/race conditions on shared config state (`config/<cfg>/*`); retry safely without overwriting concurrent state.
+* **Continuous Disk Monitoring:** Every parallel worker must verify `df -h` before launching large build jobs (`libreoffice`, `llvm`, `rust`, `gcc`, `chromium`, `qt6base`).

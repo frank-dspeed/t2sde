@@ -227,3 +227,141 @@ When multiple agents or sub-workers operate on the same T2 tree concurrently:
 * **Shared Infrastructure Lock:** If a worker discovers a bug in `scripts/functions.in`, `scripts/parse-config`, or a core stage-0 toolchain package, coordinate before modifying global scripts to avoid breaking active builds.
 * **Tolerate Config Races:** Expect transient lock/race conditions on shared config state (`config/<cfg>/*`); retry safely without overwriting concurrent state.
 * **Continuous Disk Monitoring:** Every parallel worker must verify `df -h` before launching large build jobs (`libreoffice`, `llvm`, `rust`, `gcc`, `chromium`, `qt6base`).
+
+## 11. Build-System Specific `.desc` Patterns & Variables
+
+T2 auto-detects build systems via helper scripts (`package/*/cmake/cmake.conf`, `meson.conf`, `cargo-c.conf`, `go.conf`, `python-conf.in`). Override or extend them at the bottom of `<pkg>.desc` using these exact idioms.
+
+### CMake (`CMakeLists.txt`)
+* **Auto-detection:** Triggered when `CMakeLists.txt` exists (`runcmake=1` by default). Builds out-of-tree in `objs/` automatically (`OBJECDIR` implied).
+* **Options:** Append `-D` flags directly to `confopt` (or `extraconfopt`).
+* **Disabling CMake:** If a package ships both `CMakeLists.txt` and `Makefile`/`meson.build` and you want the other build system, set `runcmake=0`.
+* **Cross-Compile Host Tools (Qt6 / KF6 / LLVM / Protobuf):**
+
+```sh
+  # Gate optional CMake dependencies
+  pkginstalled wayland || var_append confopt ' ' -DENABLE_WAYLAND=OFF
+  pkginstalled systemd polkit || var_append confopt ' ' -DBUILD_DAEMON=OFF
+
+  # Point cross builds to stage-0 native host tools
+  if atstage cross; then
+      var_append confopt ' ' "-DKF6_HOST_TOOLING=$root/TOOLCHAIN/cross/lib/cmake"
+      var_append confopt ' ' "-DQT_HOST_PATH=$root/TOOLCHAIN/cross"
+      var_append confopt ' ' "-DProtobuf_PROTOC_EXECUTABLE=$root/TOOLCHAIN/cross/bin/protoc"
+  fi
+
+  # Bypass try_run() checks that fail in cross-compilation
+  atstage cross && var_append confopt ' ' "-DHAVE_POLL_FINE_EXITCODE=0"
+
+```
+
+### Meson (`meson.build`)
+
+* **Auto-detection:** Triggered when `meson.build` exists (`runmeson=1`). Uses `ninja` automatically.
+* **Options:** Append `-Dkey=value` to `confopt` (or `mesonopt` where defined).
+* **Cross-Compilation:** T2 generates `cross.ini` automatically during `atstage cross`.
+```sh
+# Gate features (Meson uses true/false or enabled/disabled/auto)
+pkginstalled gobject-introspection || var_append confopt ' ' -Dintrospection=disabled
+pkginstalled gtk-doc || var_append confopt ' ' -Dgtk_doc=false
+
+# GObject-Introspection (gir) commonly fails in cross builds without qemu wrapper
+atstage cross && var_append confopt ' ' -Dgir=false
+
+```
+
+
+
+### Autotools (`configure` / `configure.ac`)
+
+* **Auto-detection:** Triggered by `configure` (`runconf=1`).
+* **Missing `configure`:** Set `autogen=1` (runs `autoreconf -fi`).
+* **Cross-Compile Cache (`config.cache`):** When `AC_RUN_IFELSE` fails during `atstage cross`, inject `ac_cv_*` cache variables into `confopt` or `extraconfopt`:
+```sh
+autogen=1
+pkginstalled openssl || var_append confopt ' ' --without-ssl
+atstage cross && var_append confopt ' ' "ac_cv_func_malloc_0_nonnull=yes ac_cv_file__dev_zero=yes"
+
+```
+
+
+
+### Rust / Cargo (`Cargo.toml`)
+
+* **Auto-detection:** Triggered by `Cargo.toml` (`runcargo=1`).
+* **Variables:**
+* `cargopt`: Options passed to `cargo build` (default includes `--release`).
+* `cargoinstopt`: Options passed to `cargo install`.
+
+
+* **Cross-Compilation & Linking:** T2 sets `CARGO_BUILD_TARGET` to the target rust triplet in `atstage cross`.
+* When `cargo install` doesn't fit (e.g., workspace builds, shared libraries via `cargo-c`, or custom assets), disable default install (`cargoinstopt=`) and install binaries manually from `target/$arch_target/release/` (cross) or `target/release/` (native) in `postmake`:
+
+
+```sh
+# Pass feature flags to cargo
+pkginstalled libx11 || var_append cargopt ' ' --no-default-features
+var_append cargopt ' ' "--features wayland"
+
+# Manual binary install for workspace / custom targets
+cargoinstopt=
+if atstage cross; then
+    hook_add postmake 5 "install -v -m 755 target/*-linux-*/release/mybin $root$bindir/"
+else
+    hook_add postmake 5 "install -v -m 755 target/release/mybin $root$bindir/"
+fi
+
+```
+
+
+
+### Go (`go.mod` / `*.go`)
+
+* **Auto-detection:** Triggered by `go.mod` (`rungo=1`).
+* **Variables:** `goopt` (flags passed to `go build`). T2 automatically exports `GOOS`, `GOARCH`, `GOARM`, and `CGO_ENABLED` during cross builds.
+* **CGO Cross-Compilation:** If the Go package links against C libraries (`CGO_ENABLED=1`), ensure `CC=$CC` and `PKG_CONFIG_PATH` are respected:
+```sh
+# Override target package path or ldflags
+var_append goopt ' ' "-ldflags '-s -w -X main.version=$ver'"
+var_append goopt ' ' ./cmd/mytool
+
+# Custom Go build & install when standard go.conf flow doesn't match layout
+rungo=0 runmake=0
+hook_add inmake 5 "CGO_ENABLED=1 CC=$CC go build -v -o mytool ./cmd/mytool"
+hook_add postmake 5 "install -v -m 755 mytool $root$bindir/"
+
+```
+
+
+
+### Python (`pyproject.toml` / `setup.py`)
+
+* **Auto-detection:**
+* `pyproject.toml` triggers `rungpepinstall=1` (`gpep517 build-wheel` + `python -m installer --destdir="$root" .dist/*.whl`).
+* `setup.py` (without `pyproject.toml`) triggers `runpysetup=1`.
+
+
+* **Cross-Compiled C Extensions (`pyo3` / `maturin` / `cython` / `cffi`):**
+* Ensure `_PYTHON_SYSCONFIGDATA_NAME` and cross-compiler wrappers stay active.
+* For Rust-backed Python wheels (`maturin`), pass target architecture flags via `gpep517` or `MATURIN_SETUP_ARGS`:
+
+
+```sh
+atstage cross && var_append GCC_WRAPPER_INSERT ' ' "-I$root$includedir/python3.*"
+
+```
+
+
+
+### Plain Makefile (No `configure` / `CMakeLists.txt`)
+
+* **Auto-detection:** Runs `make $makeopt` and `make $makeinstopt` (`runmake=1`).
+* **Common Fixes:** Plain Makefiles often hardcode `CC=gcc`, `PREFIX=/usr`, or ignore `DESTDIR`:
+```sh
+# Force cross tools and target prefix/destdir
+var_append makeopt ' ' "CC=$CC CXX=$CXX AR=$AR PREFIX=/$prefix"
+var_append makeinstopt ' ' "PREFIX=/$prefix DESTDIR=$root"
+
+```
+
+
